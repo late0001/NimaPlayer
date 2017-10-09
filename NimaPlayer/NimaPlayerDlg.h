@@ -40,4 +40,5 @@ public:
 	afx_msg void OnBnClickedBtnFileopen();
 	afx_msg void OnBnClickedBtnPause();
 	afx_msg void OnBnClickedBtnStop();
+	CStatic m_sta_duration;
 };

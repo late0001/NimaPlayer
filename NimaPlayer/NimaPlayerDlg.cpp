@@ -85,6 +85,7 @@ void CNimaPlayerDlg::DoDataExchange(CDataExchange* pDX)
 {
 	CDialogEx::DoDataExchange(pDX);
 	DDX_Control(pDX, IDC_EDT_URL, m_edit_url);
+	DDX_Control(pDX, IDC_LBL_DURATION, m_sta_duration);
 }
 
 BEGIN_MESSAGE_MAP(CNimaPlayerDlg, CDialogEx)
@@ -216,11 +217,12 @@ int sfp_refresh_thread(void *opaque){
 }
 int ffmpegPlay(LPVOID lpParam)
 {
-
+	CString timelong;
+	float /*framerate_temp,*/ timelong_temp/*, bitrate_temp*/;
 	AVFormatContext	*pFormatCtx;
-	int				i, videoindex;
-	AVCodecContext	*pCodecCtx;
-	AVCodec			*pCodec;
+	int				i, video_stream, audio_stream;
+	AVCodecContext	*pCodecCtx, *pCodecCtx_au;
+	AVCodec			*pCodec, *pCodec_au;
 	AVFrame	*pFrame,*pFrameYUV;
 	unsigned char *out_buffer;
 	AVPacket *packet;
@@ -267,26 +269,59 @@ int ffmpegPlay(LPVOID lpParam)
 		AfxMessageBox(L"Couldn't find stream information.\n");
 		return -1;
 	}
-	videoindex=-1;
-	for(i=0; i<pFormatCtx->nb_streams; i++) 
+	video_stream=audio_stream=-1;
+	for(i=0; i<pFormatCtx->nb_streams; i++) {
 		if(pFormatCtx->streams[i]->codec->codec_type==AVMEDIA_TYPE_VIDEO){
-			videoindex=i;
-			break;
+			video_stream=i;
 		}
-		if(videoindex==-1){
-			AfxMessageBox(L"Didn't find a video stream.\n");
+		if(pFormatCtx->streams[i]->codec->codec_type == AVMEDIA_TYPE_AUDIO){
+			audio_stream = i;
+		}
+	}
+		if(audio_stream == -1 && video_stream == -1){
+			AfxMessageBox(_T("Didn't find a video/audio stream."));
 			return -1;
 		}
-		pCodecCtx=pFormatCtx->streams[videoindex]->codec;
-		pCodec=avcodec_find_decoder(pCodecCtx->codec_id);
-		if(pCodec==NULL){
-			AfxMessageBox(L"Codec not found.\n");
-			return -1;
+
+		//视频解码参数
+		if(video_stream != -1){
+			pCodecCtx=pFormatCtx->streams[video_stream]->codec;
+			pCodec=avcodec_find_decoder(pCodecCtx->codec_id);
+			if(pCodec==NULL){
+				AfxMessageBox(L"Codec not found.\n");
+				return -1;
+			}
+			if(avcodec_open2(pCodecCtx, pCodec,NULL)<0){
+				AfxMessageBox(L"Could not open codec.\n");
+				return -1;
+			}
 		}
-		if(avcodec_open2(pCodecCtx, pCodec,NULL)<0){
-			AfxMessageBox(L"Could not open codec.\n");
-			return -1;
+		//音频解码参数
+		if(audio_stream != -1){
+			pCodecCtx_au = pFormatCtx->streams[audio_stream]->codec;
+			pCodec_au = avcodec_find_decoder(pCodecCtx_au->codec_id);
+			if(pCodec_au == NULL){
+				AfxMessageBox(_T("Audio codec not found."));
+				return -1;
+			}
+
+			if(avcodec_open2(pCodecCtx_au, pCodec_au, NULL) < 0 ){
+				AfxMessageBox(_T("Could not open audio codec."));
+				return -1;
+			}
 		}
+		//duration是以微秒为单位
+		timelong_temp = pFormatCtx->duration / 1000000;
+		int tns, thh, tmm, tss;
+		tns = pFormatCtx->duration /1000000;
+		thh = tns /3600;
+		tmm = (tns % 3600)/ 60;
+		tss = (tns % 60);
+		timelong.Format(_T("%02d:%02d:%02d"), thh, tmm, tss);
+		//timelong.Format(_T("pFormatCtx->duration = %lld,  ::%02d:%02d:%02d"),pFormatCtx->duration, thh, tmm, tss);
+		AfxMessageBox(timelong);
+		dlg->m_sta_duration.SetWindowText(timelong);
+
 		pFrame=av_frame_alloc();//保存原始的帧
 		pFrameYUV=av_frame_alloc();//保存转换后的帧
 
@@ -296,7 +331,8 @@ int ffmpegPlay(LPVOID lpParam)
 
 		//Output Info-----------------------------
 		printf("---------------- File Information ---------------\n");
-		av_dump_format(pFormatCtx,0,filePath,0);
+		//av_dump_format(pFormatCtx,0,filePath,0);
+		
 		printf("-------------------------------------------------\n");
 
 		img_convert_ctx = sws_getContext(pCodecCtx->width, pCodecCtx->height, pCodecCtx->pix_fmt, 
@@ -347,7 +383,7 @@ int ffmpegPlay(LPVOID lpParam)
 					if(av_read_frame(pFormatCtx, packet)<0)
 						thread_exit=1;
 
-					if(packet->stream_index==videoindex)
+					if(packet->stream_index==video_stream)
 						break;
 				}
 				ret = avcodec_decode_video2(pCodecCtx, pFrame, &got_picture, packet);
