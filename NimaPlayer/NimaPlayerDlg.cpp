@@ -198,9 +198,9 @@ int thread_pause=0;
 //Buffer:  
 //|-----------|-------------|  
 //chunk-------pos---len-----|  
-//static  Uint8  *audio_chunk;   
-//static  Uint32  audio_len;   
-//static  Uint8  *audio_pos;
+static  Uint8  *audio_chunk;   
+static  Uint32  audio_len;   
+static  Uint8  *audio_pos;
 
 int sfp_refresh_thread(void *opaque){
 	thread_exit=0;
@@ -224,24 +224,250 @@ int sfp_refresh_thread(void *opaque){
 	return 0;
 }
 
-typedef struct PacketQueue {
-	AVPacketList *first_pkt, *last_pkt;
-	int nb_packets;
-	int size;
-	SDL_mutex *mutex;
-	SDL_cond *cond;
-} PacketQueue;
+#define VideoBufferMaxSize 80//2048  //视频缓冲区最大值，大于此值 则不下载数据
+#define VideoBufferMinSize 20//1024  //视频缓冲区最小值，小于此值，则唤醒下载
+#define AudioBufferMaxSize 80//2048  //音频缓冲区最大值，大于此值 则不下载数据
+#define AudioBufferMinSize 20//1024  //音频缓冲区最小值，小于此值，则唤醒下载
 
-PacketQueue audioq;
+typedef struct VideoItem{
+	Uint8 *videoData; //视频数据
+	int width; //视频图片的宽度
+	int height; //视频图片的高度
+	int length; //视频长度
+	double pts; //时间戳
+	VideoItem *next; //尾部
+}VideoItem;
+
+typedef struct {
+	VideoItem *firstItem;//队列头
+	VideoItem *lastItem;//队列尾
+	int length; //队列长度
+	double bufferPts; // 缓冲的pts
+	SDL_mutex *videoMutex; //用于同步两个线程同时操作队列的 互斥量
+	SDL_cond *videoCond; //唤醒线程
+}VideoQueue;
+
+typedef struct AudioItem{
+	Uint8 *audioData;//音频数据
+	int length;//音频长度
+	double pts;//时间戳
+	AudioItem *next;
+	SDL_AudioSpec *wanted_spec;
+}AudioItem;
+//存储音频的队列
+typedef struct  {
+	AudioItem *firstItem;//队列头
+	AudioItem *lastItem; //队列尾
+	int length; //队列长度
+//	AVPacketList *first_pkt, *last_pkt; /* 队列头，队列尾 */
+//	int nb_packets; /* 队列长度 */
+	int size; 
+	SDL_mutex *audioMutex; /* 用于同步两个线程同时操作队列的 互斥量 */
+	SDL_cond *audioCond; //唤醒线程
+} AudioQueue;
+
+
+
+VideoQueue *videoQueue = NULL; //视频队列
+AudioQueue *audioQueue = NULL; //音频队列
+
+//清空视频队列
+void VideoQueueClear(VideoQueue *vq)
+{
+	VideoItem *item, *temp;
+	SDL_LockMutex(vq->videoMutex);
+	for( item = vq->firstItem; item != NULL; item = temp)
+	{
+		temp = item->next;
+		av_free(item->videoData);//释放video里面的数据
+		av_free(item);
+		vq->length--;
+	}
+	vq->firstItem = NULL;
+	vq->lastItem = NULL;
+	SDL_UnlockMutex(vq->videoMutex);
+}
+
+//清空音频队列
+void AudioQueueClear(AudioQueue *aq)
+{
+	AudioItem *item,*temp;
+	SDL_LockMutex(aq->audioMutex);
+	for (item=aq->firstItem; item!=NULL; item=temp)
+	{
+		temp=item->next;//
+		av_free(item->audioData);//释放video里面的数据
+		av_free(item->wanted_spec);
+		av_free(item);
+		aq->Length--;
+	}
+	aq->firstItem=NULL;
+	aq->lastItem=NULL;
+	SDL_UnlockMutex(aq->audioMutex);
+}
+
+//初始化视频队列
+void VideoQueueInit(VideoQueue *vq)
+{
+	memset(vq, 0, sizeof(VideoQueue));//初始化首地址为0
+	vq->videoMutex=SDL_CreateMutex();
+	vq->videoCond=SDL_CreateCond();
+}
+//初始化音频队列
+void AudioQueueInit(AudioQueue *aq)
+{
+	memset(aq,0,sizeof(AudioQueue));
+	aq->audioMutex=SDL_CreateMutex();
+	aq->audioCond=SDL_CreateCond();
+}
+
+//向队列添加数据
+int VideoQueuePut(VideoQueue *vq,VideoItem *item)
+{
+	int result=0;
+	SDL_LockMutex(vq->videoMutex);//加锁
+	if(vq->Length < VideoBufferMaxSize)
+	{
+		if(!vq->firstItem)//第一个item为null 则队列是空的
+		{
+			vq->firstItem=item;
+			vq->lastItem=item;
+			vq->length=1;
+			vq->bufferPts=item->pts;
+		}
+		else
+		{
+			vq->lastItem->next=item;//添加到队列后面
+			vq->length++;
+			vq->lastItem=item;//此item变成队列尾部
+			vq->bufferPts=item->pts;
+		}
+		if(vq->length >= VideoBufferMinSize)
+		{
+			SDL_CondSignal(vq->videoCond);//唤醒其他线程  如果缓冲区里面有几个数据后再唤醒 较好
+		}
+		result=1;
+	}
+	else
+	{
+		SDL_CondWait(vq->videoCond,vq->videoMutex);//解锁  等待被唤醒
+	}
+	SDL_UnlockMutex(vq->videoMutex);//解锁
+	return result;
+}
+//从队列中取出数据，放入item中
+int  VideoQueueGet(VideoQueue *vq,VideoItem *item)
+{
+	int result=0;
+	SDL_LockMutex(vq->videoMutex);
+	if(vq->length>0)
+	{
+		if(vq->firstItem)//有数据
+		{
+			*item=*(vq->firstItem);
+			if(!vq->firstItem->next)//只有一个
+			{
+				vq->firstItem=NULL;
+				vq->lastItem=NULL;
+			}else
+			{
+				vq->firstItem=vq->firstItem->next;
+			}
+			vq->length--;
+			item->next=NULL;
+			result= 1;
+		}
+		if(vq->length<=VideoBufferMinSize)
+		{
+			SDL_CondSignal(vq->videoCond);//唤醒下载线程
+		}
+	}
+	else
+	{
+		SDL_CondWait(vq->videoCond,vq->videoMutex);//解锁  等待被唤醒
+	}
+
+	SDL_UnlockMutex(vq->videoMutex);
+	return result;
+}
+
+//向队列添加数据
+int AudioQueuePut(AudioQueue *aq,AudioItem *item)
+{
+	int result=0;
+	SDL_LockMutex(aq->audioMutex);//加锁
+	if(aq->length<AudioBufferMaxSize)
+	{
+		if(!aq->firstItem)//第一个item为null 则队列是空的
+		{
+			aq->firstItem=item;
+			aq->lastItem=item;
+			aq->length=1;
+		}
+		else
+		{
+			aq->lastItem->next=item;//添加到队列后面
+			aq->length++;
+			aq->lastItem=item;//此item变成队列尾部
+		}
+
+		if(aq->length>=AudioBufferMinSize)
+		{
+			SDL_CondSignal(aq->audioCond);//唤醒其他线程  如果缓冲区里面有几个数据后再唤醒 较好
+		}
+		result=1;
+	}
+	else///音频缓冲区的大小 大于设定值 则让线程等待
+	{
+		SDL_CondWait(aq->audioCond,aq->audioMutex);//解锁  等待被唤醒
+	}
+	SDL_UnlockMutex(aq->audioMutex);//解锁
+	return result;
+}
+//从队列中取出数据，放入item中
+int AudioQueueGet(AudioQueue *aq,AudioItem *item)
+{
+	int result=0;
+	SDL_LockMutex(aq->audioMutex);
+	if(aq->length>0)
+	{
+		if(aq->firstItem)//有数据
+		{
+			*item=*(aq->firstItem);
+			if(!aq->firstItem->next)//只有一个
+			{
+				aq->firstItem=NULL;
+				aq->lastItem=NULL;
+			}else
+			{
+				aq->firstItem=aq->firstItem->next;
+			}
+			aq->length--;
+			item->next=NULL;
+			result=1;
+		}
+		if(aq->length<=AudioBufferMinSize)
+		{
+			SDL_CondSignal(aq->audioCond);//唤醒下载线程
+		}
+	}else
+	{
+		SDL_CondWait(aq->audioCond,aq->audioMutex);//解锁  等待被唤醒
+	}
+	SDL_UnlockMutex(aq->audioMutex);
+	return result;
+}
+
+AudioQueue audioq;
 
 //int quit = 0;
 
-void packet_queue_init(PacketQueue *q) {
-	memset(q, 0, sizeof(PacketQueue));
+void packet_queue_init(AudioQueue *q) {
+	memset(q, 0, sizeof(AudioQueue));
 	q->mutex = SDL_CreateMutex();
 	q->cond = SDL_CreateCond();
 }
-int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
+int packet_queue_put(AudioQueue *q, AVPacket *pkt) {
 
 	AVPacketList *pkt1;
 	if(av_dup_packet(pkt) < 0) {
@@ -268,7 +494,7 @@ int packet_queue_put(PacketQueue *q, AVPacket *pkt) {
 	SDL_UnlockMutex(q->mutex);
 	return 0;
 }
-static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block)
+static int packet_queue_get(AudioQueue *q, AVPacket *pkt, int block)
 {
 	AVPacketList *pkt1;
 	int ret;
@@ -360,7 +586,7 @@ int audio_decode_frame(AVCodecContext *aCodecCtx, uint8_t *audio_buf, int buf_si
 }
 
 void audio_callback(void *userdata, Uint8 *stream, int len) {
-#if 0
+#if 1
 	SDL_memset(stream, 0, len);
 	if(audio_len == 0)
 		return;
@@ -371,7 +597,7 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
 	audio_pos += len;
 	audio_len -= len;
 #endif
-
+#if 0
 	AVCodecContext *pCodecCtx_au = (AVCodecContext *)userdata;
 	int len1, audio_size;
 
@@ -400,6 +626,7 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
 		stream += len1;
 		audio_buf_index += len1;
 	}
+#endif
 }
 
 int ffmpegPlay(LPVOID lpParam)
@@ -493,7 +720,7 @@ int ffmpegPlay(LPVOID lpParam)
 			wanted_spec.format = AUDIO_S16SYS;
 			wanted_spec.channels = pCodecCtx_au->channels;
 			wanted_spec.silence = 0;
-			wanted_spec.samples = pCodecCtx_au->frame_size; //SDL_AUDIO_BUFFER_SIZE;
+			wanted_spec.samples = SDL_AUDIO_BUFFER_SIZE; //pCodecCtx_au->frame_size; 
 			wanted_spec.callback = audio_callback;
 			wanted_spec.userdata = pCodecCtx_au;
 
